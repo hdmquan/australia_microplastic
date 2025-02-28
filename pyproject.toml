@@ -16,6 +16,9 @@ loguru = "^0.7.3"
 bokeh = "^3.6.3"
 scipy = "^1.15.2"
 fastparquet = "^2024.11.0"
+plotly = "^6.0.0"
+nbformat = "^5.10.4"
+statsmodels = "^0.14.4"
 
 
 [tool.poetry.group.dev.dependencies]
