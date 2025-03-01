@@ -1,13 +1,17 @@
 #%% Imports
+import joblib
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 from sklearn.preprocessing import StandardScaler, PolynomialFeatures
 from sklearn.pipeline import Pipeline
 from sklearn.ensemble import RandomForestRegressor
 from imblearn.over_sampling import RandomOverSampler
 from src.datasets import load_and_split_dataset
+
 from src.utils.training import prepare_data, calculate_metrics, plot_predictions
+from src.utils import PATH
 
 #%% Spectral indices calculation
 def calculate_spectral_indices(df):
@@ -149,3 +153,67 @@ px.bar(importance_df,
        y='Feature',
        orientation='h',
        title='Feature Importance').show()
+
+#%% Save model
+joblib.dump(model, PATH.WEIGHTS / 'rf_feat_eng.joblib')
+
+#%% Location-based visualization
+# Get original training data coordinates and values
+train_locations = px.scatter_mapbox(
+    train_df,
+    lat='Latitude',
+    lon='Longitude',
+    size='TotalPlastics',
+    color_discrete_sequence=['black'],
+    opacity=0.5,
+    zoom=2
+)
+train_locations.update_traces(name='Training Data')
+
+# Calculate prediction error for test data
+test_true = y_test_original
+test_error = np.abs(test_pred - test_true)
+error_normalized = (test_error - test_error.min()) / (test_error.max() - test_error.min())
+
+# Create test predictions visualization
+test_locations = go.Figure(go.Scattermapbox(
+    lat=test_df['Latitude'],
+    lon=test_df['Longitude'],
+    mode='markers',
+    marker=dict(
+        size=test_pred,
+        color=error_normalized,
+        colorscale=[[0, 'blue'], [1, 'red']],
+        showscale=True,
+        opacity=0.7
+    ),
+    text=[f'Predicted: {pred:.2f}<br>Actual: {true:.2f}' 
+          for pred, true in zip(test_pred, test_true)],
+    hoverinfo='text',
+    name='Test Predictions'
+))
+
+# Combine plots
+combined_plot = go.Figure(data=train_locations.data + test_locations.data)
+
+# Calculate the center and bounds of all data points
+all_lats = pd.concat([train_df['Latitude'], test_df['Latitude']])
+all_lons = pd.concat([train_df['Longitude'], test_df['Longitude']])
+center_lat = (all_lats.max() + all_lats.min()) / 2
+center_lon = (all_lons.max() + all_lons.min()) / 2
+
+combined_plot.update_layout(
+    mapbox_style="carto-positron",
+    title="Training Data and Test Predictions<br>Size: Microplastic concentration, Color: Prediction Error (Test only) Lighter = lower error",
+    showlegend=True,
+    mapbox=dict(
+        center=dict(lat=center_lat, lon=center_lon),
+        zoom=2
+    ),
+    width=800,  # Set width
+    height=800  # Set equal height for 1:1 aspect ratio
+)
+
+combined_plot.show()
+
+#%%
