@@ -24,6 +24,7 @@ modis-tools = "^1.2.0"
 python-cmr = "^0.13.0"
 rasterio = "^1.4.3"
 pyhdf = "^0.11.6"
+scikit-learn = "^1.6.1"
 
 
 [tool.poetry.group.dev.dependencies]

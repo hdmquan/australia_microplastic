@@ -59,13 +59,37 @@ def extract_modis_bands(hdf_file):
                 if ds_name in target_bands:
                     dataset = hdf.select(ds_name)
                     data = dataset[:]
-                    scale_factor = dataset.attributes().get('scale_factor', 1)
+                    attrs = dataset.attributes()
                     
-                    # Apply scale factor if available
-                    if scale_factor != 1:
-                        data = data.astype(float) * scale_factor
+                    # Get scale factor and offset
+                    scale_factor = attrs.get('scale_factor', 1)
+                    add_offset = attrs.get('add_offset', 0)
+                    
+                    # Get fill value
+                    fill_value = attrs.get('_FillValue', 32767)  # Default MODIS fill value
+                    
+                    # Convert to float and mask fill values
+                    data = data.astype(float)
+                    data[data == fill_value] = np.nan
+                    
+                    # Apply scale factor and offset
+                    data = data * scale_factor + add_offset
+                    
+                    # Apply valid range check (reflectance should be 0-1)
+                    valid_min = attrs.get('valid_min', 0)
+                    valid_max = attrs.get('valid_max', 1)
+                    data[data < valid_min] = np.nan
+                    data[data > valid_max] = np.nan
                     
                     bands_data[ds_name] = data
+                    
+                    # Log statistics for debugging
+                    valid_data = data[~np.isnan(data)]
+                    if len(valid_data) > 0:
+                        logger.info(f"Band {ds_name} stats - Min: {valid_data.min():.4f}, "
+                                   f"Max: {valid_data.max():.4f}, Mean: {valid_data.mean():.4f}, "
+                                   f"NaN: {np.isnan(data).sum()} pixels")
+                
             except Exception as e:
                 logger.warning(f"Failed to extract band {ds_name}: {str(e)}")
                 continue
@@ -110,6 +134,209 @@ def get_nearest_pixel_value(lat, lon, band_data):
     except Exception as e:
         logger.warning(f"Error calculating pixel coordinates for {lat}, {lon}: {str(e)}")
         return np.nan
+
+def impute_modis_temporal(df):
+    """Impute missing MODIS values using temporal interpolation"""
+    # Create a copy to avoid warnings
+    df_imputed = df.copy()
+    
+    # Sort by location and time
+    df_imputed = df_imputed.sort_values(['Latitude', 'Longitude', 'DateUTC'])
+    
+    # Get all MODIS band columns
+    modis_cols = [col for col in df_imputed.columns if col.startswith('modis_sur_refl_b')]
+    
+    # Group by location and interpolate within each group
+    logger.info("Performing temporal interpolation for MODIS bands")
+    
+    # Group by location (rounded to 2 decimal places for spatial proximity)
+    df_imputed['lat_bin'] = np.round(df_imputed['Latitude'], 2)
+    df_imputed['lon_bin'] = np.round(df_imputed['Longitude'], 2)
+    
+    # Apply interpolation to each spatial group
+    for (lat, lon), group in df_imputed.groupby(['lat_bin', 'lon_bin']):
+        if len(group) > 1:  # Need at least 2 points for interpolation
+            # Get indices in the original dataframe
+            idx = group.index
+            
+            # Interpolate MODIS bands (linear is most appropriate)
+            interpolated = group[modis_cols].interpolate(method='linear', limit=3)
+            
+            # Update the values in the main dataframe
+            df_imputed.loc[idx, modis_cols] = interpolated
+    
+    # Remove temporary columns
+    df_imputed = df_imputed.drop(columns=['lat_bin', 'lon_bin'])
+    
+    # Log imputation statistics
+    for col in modis_cols:
+        before = df[col].isna().sum()
+        after = df_imputed[col].isna().sum()
+        filled = before - after
+        logger.info(f"Imputed {filled} values in {col} ({filled/len(df)*100:.1f}%)")
+    
+    return df_imputed
+
+def impute_modis_spatial(df, date_col='DateUTC', time_window='M'):
+    """Impute missing MODIS values using spatial interpolation within time windows"""
+    from scipy.interpolate import griddata
+    
+    df_imputed = df.copy()
+    modis_cols = [col for col in df.columns if col.startswith('modis_sur_refl_b')]
+    
+    # Add time period column for grouping
+    df_imputed['time_period'] = pd.to_datetime(df_imputed[date_col]).dt.to_period(time_window)
+    
+    # Process each time period separately
+    for period, period_df in df_imputed.groupby('time_period'):
+        logger.info(f"Processing spatial interpolation for period {period}")
+        
+        # For each MODIS band
+        for col in modis_cols:
+            # Skip if no valid data in this period
+            if period_df[col].notna().sum() < 3:  # Need at least 3 points for 2D interpolation
+                continue
+                
+            # Get points with valid data
+            valid_mask = period_df[col].notna()
+            points = period_df.loc[valid_mask, ['Latitude', 'Longitude']].values
+            values = period_df.loc[valid_mask, col].values
+            
+            # Points to interpolate
+            missing_mask = period_df[col].isna()
+            if missing_mask.sum() == 0:
+                continue
+                
+            xi = period_df.loc[missing_mask, ['Latitude', 'Longitude']].values
+            
+            # Perform interpolation (use 'linear' or 'cubic')
+            try:
+                interpolated = griddata(points, values, xi, method='linear')
+                
+                # Update values in the dataframe
+                period_indices = period_df.index[missing_mask]
+                df_imputed.loc[period_indices, col] = interpolated
+            except Exception as e:
+                logger.warning(f"Spatial interpolation failed for {col} in period {period}: {e}")
+    
+    # Remove temporary column
+    df_imputed = df_imputed.drop(columns=['time_period'])
+    
+    # Log results
+    for col in modis_cols:
+        before = df[col].isna().sum()
+        after = df_imputed[col].isna().sum()
+        filled = before - after
+        logger.info(f"Spatially imputed {filled} values in {col} ({filled/len(df)*100:.1f}%)")
+    
+    return df_imputed
+
+def impute_modis_band_correlation(df):
+    """Impute missing values using correlations between bands"""
+    from sklearn.ensemble import RandomForestRegressor
+    
+    df_imputed = df.copy()
+    modis_cols = [col for col in df.columns if col.startswith('modis_sur_refl_b')]
+    
+    # For each band
+    for target_col in modis_cols:
+        # Skip if band has no missing values
+        if df_imputed[target_col].isna().sum() == 0:
+            continue
+            
+        logger.info(f"Imputing {target_col} using other bands")
+        
+        # Find rows where target is missing but other bands have data
+        missing_mask = df_imputed[target_col].isna()
+        
+        # Create feature matrix from other bands
+        feature_cols = [col for col in modis_cols if col != target_col]
+        
+        # Train on rows where target is not missing
+        train_mask = ~missing_mask
+        if train_mask.sum() < 10:  # Need enough training data
+            logger.warning(f"Not enough training data for {target_col}")
+            continue
+            
+        # Check if we have enough complete rows for training
+        X_train = df_imputed.loc[train_mask, feature_cols]
+        if X_train.isna().any(axis=1).all():
+            logger.warning(f"No complete feature rows for training {target_col}")
+            continue
+            
+        # Drop rows with NaN in features
+        valid_train = ~X_train.isna().any(axis=1)
+        X_train = X_train[valid_train]
+        y_train = df_imputed.loc[train_mask, target_col][valid_train]
+        
+        if len(X_train) < 10:
+            logger.warning(f"Not enough complete training samples for {target_col}")
+            continue
+            
+        # Train model
+        model = RandomForestRegressor(n_estimators=100, random_state=42)
+        model.fit(X_train, y_train)
+        
+        # Predict for rows with missing target but complete features
+        to_predict = missing_mask & ~df_imputed[feature_cols].isna().any(axis=1)
+        if to_predict.sum() > 0:
+            X_pred = df_imputed.loc[to_predict, feature_cols]
+            predictions = model.predict(X_pred)
+            
+            # Ensure predictions are within valid range
+            predictions = np.clip(predictions, 0, 1)
+            
+            # Update values
+            df_imputed.loc[to_predict, target_col] = predictions
+            
+            logger.info(f"Imputed {to_predict.sum()} values in {target_col}")
+    
+    return df_imputed
+
+def impute_modis_combined(df):
+    """Apply multiple imputation methods in sequence"""
+    # First try temporal interpolation (most accurate)
+    df_imputed = impute_modis_temporal(df)
+    
+    # Then try spatial interpolation for remaining missing values
+    df_imputed = impute_modis_spatial(df_imputed)
+    
+    # Finally use band correlation for any remaining gaps
+    df_imputed = impute_modis_band_correlation(df_imputed)
+    
+    # For any remaining missing values, use monthly means
+    modis_cols = [col for col in df_imputed.columns if col.startswith('modis_sur_refl_b')]
+    df_imputed['month'] = pd.to_datetime(df_imputed['DateUTC']).dt.month
+    
+    for col in modis_cols:
+        # Calculate monthly means for each band
+        monthly_means = df_imputed.groupby('month')[col].mean()
+        
+        # Fill remaining NaNs with monthly means
+        for month, mean_val in monthly_means.items():
+            month_mask = (df_imputed['month'] == month) & (df_imputed[col].isna())
+            df_imputed.loc[month_mask, col] = mean_val
+    
+    # Remove temporary column
+    df_imputed = df_imputed.drop(columns=['month'])
+    
+    # Log final imputation statistics
+    for col in modis_cols:
+        remaining = df_imputed[col].isna().sum()
+        if remaining > 0:
+            logger.warning(f"{col} still has {remaining} missing values ({remaining/len(df_imputed)*100:.1f}%)")
+        else:
+            logger.info(f"{col} successfully imputed all values")
+    
+    # Final fallback - use global mean for any remaining missing values
+    for col in modis_cols:
+        if df_imputed[col].isna().sum() > 0:
+            global_mean = df_imputed[col].mean()
+            if not np.isnan(global_mean):
+                df_imputed[col].fillna(global_mean, inplace=True)
+                logger.info(f"Filled remaining {col} values with global mean: {global_mean:.4f}")
+    
+    return df_imputed
 
 def main():
     logger.info("Starting MODIS data processing")
@@ -169,16 +396,26 @@ def main():
     # Remove temporary month column
     mp_data = mp_data.drop(columns=['_month'])
     
+    # Log coverage statistics before imputation
+    non_null_counts = mp_data.filter(like='modis_').notna().sum()
+    logger.info("MODIS data coverage before imputation:")
+    for col, count in non_null_counts.items():
+        logger.info(f"{col}: {count}/{len(mp_data)} values ({count/len(mp_data)*100:.1f}%)")
+    
+    # Apply imputation
+    logger.info("Applying imputation to fill missing MODIS values")
+    mp_data = impute_modis_combined(mp_data)
+    
+    # Log coverage statistics after imputation
+    non_null_counts = mp_data.filter(like='modis_').notna().sum()
+    logger.info("MODIS data coverage after imputation:")
+    for col, count in non_null_counts.items():
+        logger.info(f"{col}: {count}/{len(mp_data)} values ({count/len(mp_data)*100:.1f}%)")
+    
     # Save merged dataset
     output_file = PATH.PROCESSED_DATA / "nettows_with_modis.parquet"
     mp_data.to_parquet(output_file)
     logger.info(f"Saved merged dataset to {output_file}")
-    
-    # Log coverage statistics
-    non_null_counts = mp_data.filter(like='modis_').notna().sum()
-    logger.info("MODIS data coverage:")
-    for col, count in non_null_counts.items():
-        logger.info(f"{col}: {count}/{len(mp_data)} values ({count/len(mp_data)*100:.1f}%)")
 
 if __name__ == "__main__":
     main()
