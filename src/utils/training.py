@@ -5,7 +5,7 @@ from sklearn.metrics import r2_score, mean_squared_error
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from typing import Dict, Tuple, Any, Optional
-
+from loguru import logger
 def prepare_data(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,
@@ -41,6 +41,7 @@ def plot_predictions(
     y_test_pred: np.ndarray,
     log_scale: bool = True
 ) -> go.Figure:
+    logger.info(f"Plotting predictions for training and test sets")
     """Create actual vs predicted plot."""
     fig = make_subplots(
         rows=2, cols=1,
