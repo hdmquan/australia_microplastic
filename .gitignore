@@ -32,6 +32,7 @@ data/raw/readme.txt
 *.tif
 *.TIF
 *.ico
+*.hdf
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

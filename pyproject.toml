@@ -19,6 +19,11 @@ fastparquet = "^2024.11.0"
 plotly = "^6.0.0"
 nbformat = "^5.10.4"
 statsmodels = "^0.14.4"
+dotenv = "^0.9.9"
+modis-tools = "^1.2.0"
+python-cmr = "^0.13.0"
+rasterio = "^1.4.3"
+pyhdf = "^0.11.6"
 
 
 [tool.poetry.group.dev.dependencies]

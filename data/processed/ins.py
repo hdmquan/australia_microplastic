@@ -11,3 +11,7 @@ nettows.head()
 nettows.info()
 
 # %%
+unique_dates = nettows['DateUTC'].unique()
+print("Unique values in DateUTC:")
+print(unique_dates)
+
